@@ -30,10 +30,18 @@
 - Added per-cycle pipeline status, risk decisions, reconciled holdings, and paper order history.
 - Added a read-only dashboard API and a health endpoint. The dashboard and API bind to localhost by default.
 
+## Dynamic asset discovery and local time
+
+- Discover active US equities and crypto spot pairs from Alpaca and persist the catalog independently of scan results.
+- Rotate market scans in batches, prioritize held assets, and keep the most recent validated chart available for each asset.
+- Added a searchable, paginated Markets view, a market filter, and last-bar timestamps. Non-USD pairs are displayed in their quote currency and skipped for automated orders.
+- Display dashboard, chart, and Telegram times in Bangkok time (UTC+7). Scheduling and stored timestamps still use UTC.
+
 ## Verification
 
 - Ran the Python syntax check, validated the Compose configuration, and built Next.js for production. The final npm audit reported zero known vulnerabilities.
 - Verified that simulated cycles complete all eleven stages. A separate PostgreSQL test verified the advisory lock, one-cycle-per-slot constraint, a simulated fill, persisted AI and risk decisions, and the reconciled cash and position.
 - Verified stock sell and crypto buy payloads against mocked Alpaca paper responses, including lookup by client order ID. Checked stale-bar rejection, indicator output, and the structured OpenAI response using a mock.
 - Verified the running Next.js page and dashboard API. Received an automatically scheduled cycle's WebSocket event through the production Next.js proxy. The managed browser preview relay timed out during startup.
-- Live Alpaca, OpenAI, and Telegram connections require account credentials and remain unverified.
+- Tested catalog discovery, batching and pagination, rotation, search, retained charts, and the USD-only paper-order gate with mocked Alpaca responses and PostgreSQL.
+- Live Alpaca, OpenAI, and Telegram connections require account credentials and remain unverified in the development environment.

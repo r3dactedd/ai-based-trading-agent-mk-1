@@ -3,14 +3,9 @@ from datetime import timedelta
 from decimal import Decimal, ROUND_DOWN
 from zoneinfo import ZoneInfo
 
-from config import settings
-from market import PAPER, headers, timestamp
+from market import PAPER, headers
 
 NY = ZoneInfo("America/New_York")
-
-
-def normalized_symbol(value):
-    return next((symbol for symbol in settings.crypto if symbol.replace("/", "") == value), value)
 
 
 def decimal_string(value, digits):
@@ -23,11 +18,46 @@ class Alpaca:
         self.client = client
         self.clock = None
         self.sessions = None
+        self.crypto_symbols = {}
 
     def get(self, path, params=None):
         response = self.client.get(PAPER + path, params=params, headers=headers())
         response.raise_for_status()
         return response.json()
+
+    def assets(self):
+        assets = {}
+        for api_class, asset_class in (("us_equity", "stock"), ("crypto", "crypto")):
+            for row in self.get("/v2/assets", {"status": "active", "asset_class": api_class}):
+                if row["status"] != "active":
+                    continue
+                symbol = row["symbol"].strip().upper()
+                if asset_class == "crypto":
+                    symbol = self.normalize_symbol(symbol, "crypto")
+                if not symbol or asset_class == "crypto" and "/" not in symbol:
+                    continue
+                assets[symbol] = {"symbol": symbol, "asset_class": asset_class,
+                                  "name": row.get("name") or symbol, "exchange": row.get("exchange"),
+                                  "tradable": row.get("tradable") is True,
+                                  "fractionable": row.get("fractionable") is True}
+        return list(assets.values())
+
+    def set_catalog(self, assets):
+        self.crypto_symbols = {symbol.replace("/", ""): symbol for symbol, row in assets.items()
+                               if row["asset_class"] == "crypto"}
+
+    def normalize_symbol(self, symbol, asset_class):
+        if asset_class != "crypto" or "/" in symbol:
+            return symbol
+        if symbol in self.crypto_symbols:
+            return self.crypto_symbols[symbol]
+        for quote in ("USDC", "USDT", "USD", "BTC"):
+            if symbol.endswith(quote) and len(symbol) > len(quote):
+                return f"{symbol[:-len(quote)]}/{quote}"
+        return symbol
+
+    def held_symbols(self):
+        return {self.normalize_symbol(row["symbol"], row["asset_class"]) for row in self.get("/v2/positions")}
 
     def stock_open(self):
         if self.clock is None:
@@ -43,7 +73,7 @@ class Alpaca:
         return bool(bounds and bounds[0] <= local_time.strftime("%H:%M") < bounds[1])
 
     def load_sessions(self, slot):
-        if settings.stocks and self.stock_open():
+        if self.stock_open():
             day = slot.astimezone(NY).date()
             self.sessions = {row["date"]: (row["open"], row["close"]) for row in
                              self.get("/v2/calendar", {"start": day - timedelta(days=14), "end": day})}
@@ -52,7 +82,7 @@ class Alpaca:
         account = self.get("/v2/account")
         positions = {}
         for row in self.get("/v2/positions"):
-            symbol = normalized_symbol(row["symbol"])
+            symbol = self.normalize_symbol(row["symbol"], row["asset_class"])
             positions[symbol] = {"qty": float(row["qty"]), "avg_entry": float(row["avg_entry_price"]),
                                  "price": float(row["current_price"]),
                                  "market_value": float(row["market_value"]),
@@ -69,7 +99,7 @@ class Alpaca:
         for row in rows:
             if row.get("legs"):
                 raise ValueError("An external multi-leg order needs manual review")
-            output.append({**row, "symbol": normalized_symbol(row["symbol"])})
+            output.append({**row, "symbol": self.normalize_symbol(row["symbol"], row["asset_class"])})
         return output
 
     def lookup(self, client_id):

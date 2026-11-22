@@ -3,6 +3,7 @@ import signal
 import threading
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 import httpx
 from psycopg.types.json import Jsonb
@@ -13,6 +14,7 @@ from db import connect, event, initialize, step
 from execution import persist_signals, reconcile_orders, risk, submit
 from market import scan, timestamp
 from strategy import candidates, evaluate, features, return_samples
+from universe import discover, eligible_batch, record_scan
 
 LOGGER = logging.getLogger("trading.worker")
 STOP = threading.Event()
@@ -24,16 +26,21 @@ def safe_error(exc):
 
 
 def previous_returns(db, symbol):
-    row = db.execute("""SELECT s.details->'returns' AS samples FROM scans s JOIN cycles c ON s.cycle_id=c.id
-                        WHERE c.mode=%s AND s.symbol=%s AND s.status='ready'
-                          AND c.slot >= now() - interval '7 days'
-                        ORDER BY c.slot DESC LIMIT 1""", (settings.mode, symbol)).fetchone()
+    row = db.execute("""SELECT latest_ready->'returns' AS samples FROM assets
+                        WHERE mode=%s AND symbol=%s
+                          AND (latest_ready->>'bar_time')::timestamptz >= now() - interval '7 days'""",
+                     (settings.mode, symbol)).fetchone()
+    if row is None:
+        row = db.execute("""SELECT s.details->'returns' AS samples FROM scans s JOIN cycles c ON s.cycle_id=c.id
+                            WHERE c.mode=%s AND s.symbol=%s AND s.status='ready'
+                              AND c.slot >= now() - interval '7 days' AND s.details ? 'returns'
+                            ORDER BY c.slot DESC LIMIT 1""", (settings.mode, symbol)).fetchone()
     return {timestamp(time): value for time, value in row["samples"]} if row and row["samples"] else {}
 
 
 def run_cycle(db, client, cycle, slot):
     broker = Demo() if settings.mode == "demo" else Alpaca(client)
-    summary = {"universe": len(settings.universe), "ready": 0, "candidates": 0,
+    summary = {"universe": 0, "ready": 0, "scanned": 0, "unavailable": 0, "candidates": 0,
                "eligible": 0, "orders": 0, "unconfirmed": 0, "errors": 0, "ai": "openai" if settings.uses_openai else "demo"}
     prices = {}
     current = "initialize"
@@ -41,16 +48,43 @@ def run_cycle(db, client, cycle, slot):
     try:
         step(db, cycle, current, detail="PostgreSQL lock acquired")
         current = "scan"
-        data = scan(client, broker, slot)
-        summary["closed"] = sum(row[0] == "closed" for row in data.values())
+        assets, warning = discover(db, broker, slot)
+        summary["universe"] = len(assets)
+        stock_session = "unknown"
+        priority = set()
+        if settings.mode == "alpaca":
+            broker.set_catalog(assets)
+            try:
+                priority = broker.held_symbols()
+            except Exception as exc:
+                summary["errors"] += 1
+                warning = f"Could not prioritize held assets ({safe_error(exc)})"
+        try:
+            stock_session = "open" if broker.stock_open() else "closed"
+            if stock_session == "open" and settings.mode == "alpaca":
+                broker.load_sessions(slot)
+        except Exception as exc:
+            stock_session = "unknown"
+            summary["errors"] += 1
+            warning = f"Stock calendar unavailable ({safe_error(exc)})"
+        db.execute("UPDATE asset_catalogs SET stock_session=%s WHERE mode=%s", (stock_session, settings.mode))
+        selected = eligible_batch(assets, priority, settings.stock_scan_limit, settings.crypto_scan_limit,
+                                  stock_session == "open")
+        data = scan(client, broker, slot, selected)
+        summary["closed"] = sum(row["asset_class"] == "stock" for row in assets.values()) if stock_session == "closed" else 0
         summary["unavailable"] = sum(row[0] == "unavailable" for row in data.values())
-        step(db, cycle, current, "degraded" if summary["unavailable"] else "done",
-             f"{len(data)} assets checked")
+        summary["scanned"] = sum(row[0] != "deferred" for row in data.values())
+        summary["queued"] = summary["universe"] - summary["scanned"] - summary["closed"]
+        detail = f"{summary['scanned']} of {len(assets)} catalog assets checked"
+        step(db, cycle, current, "degraded" if warning else "done",
+             f"{detail}. {warning}" if warning else detail)
 
         current = "indicators"
         indicators, returns = {}, {}
         with db.transaction():
             for symbol, (state, reason, bars) in data.items():
+                if state == "deferred":
+                    continue
                 details = {"reason": reason}
                 if state == "ready":
                     try:
@@ -62,40 +96,57 @@ def run_cycle(db, client, cycle, slot):
                     except ValueError as exc:
                         state, details = "unavailable", {"reason": str(exc)}
                         summary["unavailable"] += 1
-                db.execute("INSERT INTO scans VALUES (%s,%s,%s,%s,%s)",
-                           (cycle, symbol, settings.universe[symbol], state, Jsonb(details)))
+                record_scan(db, cycle, slot, symbol, assets[symbol]["asset_class"], state, details)
         summary["ready"] = len(indicators)
         step(db, cycle, current, "degraded" if summary["unavailable"] else "done",
              f"{len(indicators)} assets passed validation")
 
         current = "signals"
-        prices = {symbol: row["price"] for symbol, row in indicators.items()}
+        prices = {symbol: row["price"] for symbol, row in indicators.items()
+                  if assets[symbol]["asset_class"] == "stock" or symbol.endswith("/USD")}
         portfolio = broker.portfolio(db, prices)
         signals = candidates(indicators, portfolio["positions"])
         summary["candidates"] = len(signals)
         for row in signals:
-            row.update(decision={"action": "pending"}, conviction=None, risk="Pending evaluation")
+            asset = assets[row["symbol"]]
+            row.update(asset_class=asset["asset_class"], decision={"action": "pending"},
+                       conviction=None, risk="Pending evaluation")
+            if not asset["tradable"]:
+                row["risk"] = "Asset is not tradable on Alpaca"
+            elif asset["asset_class"] == "crypto" and not row["symbol"].endswith("/USD"):
+                row["risk"] = "Paper orders require a USD quote"
+            elif asset["asset_class"] == "stock" and not asset["fractionable"] and row["side"] == "buy":
+                row["risk"] = "Stock is not eligible for fractional orders"
         persist_signals(db, cycle, signals)
         step(db, cycle, current, detail=f"{len(signals)} candidates")
 
         current = "ai"
+        evaluable = [row for row in signals if row["risk"] == "Pending evaluation"]
+        entries = sorted((row for row in evaluable if row["side"] == "buy"),
+                         key=lambda row: (-row["quant_score"], row["symbol"]))
+        exits = [row for row in evaluable if row["side"] == "sell"]
+        review = exits + entries[:24]
         try:
-            context = {"stock_session_open": any(
-                data[symbol][0] == "ready" for symbol in settings.stocks),
+            context = {"stock_session_open": stock_session == "open",
                 "assets": {symbol: {"return_1h": f["return_1h"], "rsi": f["rsi"]}
                            for symbol, f in indicators.items()}}
-            decisions = evaluate(client, signals, indicators, context)
+            decisions = evaluate(client, review, indicators, context)
             step(db, cycle, current, detail=f"{len(decisions)} evaluations")
         except Exception as exc:
             summary["errors"] += 1
             decisions = {row["symbol"]: {"action": "reject", "score": 0, "source": "unavailable",
-                                         "reason": f"AI evaluation failed ({safe_error(exc)})"} for row in signals}
+                                         "reason": f"AI evaluation failed ({safe_error(exc)})"} for row in review}
             step(db, cycle, current, "degraded", safe_error(exc))
 
         current = "conviction"
         qualified = []
         for row in signals:
-            decision = decisions[row["symbol"]]
+            decision = decisions.get(row["symbol"])
+            if decision is None:
+                if row["risk"] == "Pending evaluation":
+                    row["risk"] = "AI review limit reached"
+                row["decision"] = {"action": "skipped", "reason": row["risk"]}
+                continue
             conviction = round(.65 * row["quant_score"] + .35 * decision["score"], 1)
             row.update(decision=decision, conviction=conviction, risk="Signal quality gate")
             # Protective exits still require a valid market bar and deterministic account checks.
@@ -113,10 +164,11 @@ def run_cycle(db, client, cycle, slot):
         pending.update({row["client_order_id"]: row for row in broker.open_orders()})
         # Re-read holdings after checking order transitions from the previous slot.
         portfolio = broker.portfolio(db, prices)
+        usd_returns = {symbol: returns[symbol] for symbol in prices}
         for symbol in set(portfolio["positions"]) | {row["symbol"] for row in pending.values()}:
-            if symbol not in returns:
-                returns[symbol] = previous_returns(db, symbol)
-        planned, drawdown = risk(db, portfolio, pending.values(), qualified, returns, prices, slot)
+            if symbol not in usd_returns and ("/" not in symbol or symbol.endswith("/USD")):
+                usd_returns[symbol] = previous_returns(db, symbol)
+        planned, drawdown = risk(db, portfolio, pending.values(), qualified, usd_returns, prices, slot)
         summary["drawdown"] = drawdown
         persist_signals(db, cycle, signals)
         step(db, cycle, current, detail=f"{len(planned)} approved by portfolio limits")
@@ -156,8 +208,8 @@ def run_cycle(db, client, cycle, slot):
             response = client.post(f"https://api.telegram.org/bot{settings.telegram_token}/sendMessage",
                                    json={"chat_id": settings.telegram_chat_id,
                                          "text": (f"Paper trading · {settings.mode} · {status}\n"
-                                                  f"{slot:%Y-%m-%d %H:%M} UTC · {str(cycle)[:8]}\n"
-                                                  f"Assets ready {summary['ready']}/{summary['universe']}\n"
+                                                  f"{slot.astimezone(ZoneInfo('Asia/Bangkok')):%Y-%m-%d %H:%M} UTC+7 · {str(cycle)[:8]}\n"
+                                                  f"Assets ready {summary['ready']}/{summary['scanned']} scanned of {summary['universe']} listed\n"
                                                   f"Candidates {summary['candidates']} · Orders {summary['orders']}\n"
                                                   f"Unconfirmed {summary['unconfirmed']} · Errors {summary['errors']}")})
             response.raise_for_status()

@@ -64,3 +64,24 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS orders_mode_time ON orders(mode, created_at DESC);
 CREATE INDEX IF NOT EXISTS portfolios_mode_time ON portfolios(mode, recorded_at DESC);
 CREATE INDEX IF NOT EXISTS events_mode_id ON events(mode, id DESC);
+
+CREATE TABLE IF NOT EXISTS asset_catalogs (
+    mode text PRIMARY KEY,
+    refreshed_at timestamptz NOT NULL,
+    stock_session text NOT NULL DEFAULT 'unknown'
+);
+CREATE TABLE IF NOT EXISTS assets (
+    mode text NOT NULL,
+    symbol text NOT NULL,
+    asset_class text NOT NULL,
+    name text NOT NULL,
+    exchange text,
+    tradable boolean NOT NULL,
+    fractionable boolean NOT NULL,
+    last_scan_at timestamptz,
+    scan_status text,
+    scan_reason text,
+    latest_ready jsonb,
+    PRIMARY KEY (mode, symbol)
+);
+CREATE INDEX IF NOT EXISTS assets_rotation ON assets(mode, asset_class, last_scan_at NULLS FIRST, symbol);

@@ -31,6 +31,8 @@ class Settings:
     telegram_chat_id: str = env("TELEGRAM_CHAT_ID")
     stocks: tuple = symbols("STOCK_SYMBOLS", "SPY,QQQ,AAPL,MSFT,NVDA")
     crypto: tuple = symbols("CRYPTO_SYMBOLS", "BTC/USD,ETH/USD")
+    stock_scan_limit: int = int(number("STOCK_SCAN_LIMIT", 160, 1, 300))
+    crypto_scan_limit: int = int(number("CRYPTO_SCAN_LIMIT", 100, 1, 200))
     min_conviction: float = number("MIN_CONVICTION", 70, 0, 100)
     min_ai: float = number("MIN_AI_SCORE", 55, 0, 100)
     order_pct: float = number("ORDER_EQUITY_PCT", .03, .001, 1)
@@ -55,11 +57,11 @@ class Settings:
             raise ValueError("Alpaca mode requires OpenAI evaluation")
         if bool(self.telegram_token) != bool(self.telegram_chat_id):
             raise ValueError("Set both Telegram variables to enable notifications")
-        if not self.stocks and not self.crypto:
+        if self.mode == "demo" and not self.stocks and not self.crypto:
             raise ValueError("Configure at least one symbol")
-        if any("/" in symbol for symbol in self.stocks) or any(
+        if self.mode == "demo" and (any("/" in symbol for symbol in self.stocks) or any(
             not symbol.endswith("/USD") for symbol in self.crypto
-        ):
+        )):
             raise ValueError("Use stock tickers and USD crypto pairs such as BTC/USD")
 
     @property

@@ -3,7 +3,7 @@ import asyncio
 import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from psycopg import Error as DatabaseError
 from starlette.concurrency import run_in_threadpool
 
@@ -34,12 +34,11 @@ def dashboard():
         cycles = db.execute("""SELECT * FROM cycles WHERE mode=%s ORDER BY slot DESC LIMIT 20""",
                             (settings.mode,)).fetchall()
         latest = cycles[0]["id"] if cycles else None
-        scan_cycle = db.execute("""SELECT c.id FROM cycles c WHERE c.mode=%s AND
-                                  EXISTS (SELECT 1 FROM scans s WHERE s.cycle_id=c.id)
-                                  ORDER BY c.slot DESC LIMIT 1""", (settings.mode,)).fetchone()
-        scans = db.execute("""SELECT symbol,asset_class,status,details-'returns' AS details
-                             FROM scans WHERE cycle_id=%s ORDER BY asset_class DESC,symbol""",
-                           (scan_cycle["id"] if scan_cycle else None,)).fetchall()
+        scans = catalog_rows(db, "", "", 0, 10, overview=True)
+        catalog = db.execute("""SELECT count(*) AS total,
+                                 count(*) FILTER (WHERE asset_class='stock') AS stocks,
+                                 count(*) FILTER (WHERE asset_class='crypto') AS crypto
+                                 FROM assets WHERE mode=%s""", (settings.mode,)).fetchone()
         signals = db.execute("""SELECT * FROM signals WHERE cycle_id=%s
                                ORDER BY conviction DESC NULLS LAST,symbol""", (latest,)).fetchall()
         orders = db.execute("SELECT * FROM orders WHERE mode=%s ORDER BY created_at DESC LIMIT 40",
@@ -52,10 +51,64 @@ def dashboard():
         peak = db.execute("SELECT max(equity) AS peak FROM portfolios WHERE mode=%s",
                           (settings.mode,)).fetchone()["peak"]
     return {"mode": settings.mode, "ai": settings.model if settings.uses_openai else "Demo evaluator",
-            "interval": settings.slot_seconds, "server_time": datetime.now(timezone.utc), "cycles": cycles, "scans": scans,
+            "interval": settings.slot_seconds, "server_time": datetime.now(timezone.utc), "cycles": cycles, "scans": scans, "catalog": catalog,
             "signals": signals, "orders": orders, "portfolio": history[0] if history else None,
             "equity": [[row["recorded_at"], row["equity"]] for row in reversed(history)],
             "peak_equity": peak, "events": events}
+
+
+CATALOG_FILTER = """a.mode=%(mode)s AND (%(kind)s='' OR a.asset_class=%(kind)s)
+                    AND (%(query)s='' OR strpos(upper(a.symbol),%(query)s)>0
+                         OR strpos(upper(a.name),%(query)s)>0)"""
+
+
+def catalog_rows(db, query, kind, offset, limit, *, overview=False, symbol=None):
+    fields = "a.latest_ready - 'returns'" if overview or symbol else "a.latest_ready - 'returns' - 'chart'"
+    order = ("(a.last_scan_at IS NOT NULL AND a.scan_status='ready') DESC, "
+             "a.last_scan_at DESC NULLS LAST, a.symbol") if overview else "a.symbol"
+    return db.execute(f"""SELECT a.symbol,a.asset_class,a.name,a.exchange,a.tradable,a.fractionable,
+                                a.last_scan_at,
+                           CASE
+                             WHEN a.asset_class='stock' AND c.stock_session='closed' THEN 'closed'
+                             WHEN a.asset_class='stock' AND c.stock_session='unknown' THEN 'unavailable'
+                             WHEN a.last_scan_at IS NULL OR a.last_scan_at < now()-interval '8 minutes'
+                               THEN 'queued'
+                             ELSE coalesce(a.scan_status,'queued')
+                           END AS status,
+                           coalesce({fields}, '{{}}'::jsonb) ||
+                           jsonb_build_object('reason', CASE
+                             WHEN a.asset_class='stock' AND c.stock_session='closed'
+                               THEN 'US regular session is closed'
+                             WHEN a.asset_class='stock' AND c.stock_session='unknown'
+                               THEN 'US market session could not be verified'
+                             WHEN a.last_scan_at IS NULL OR a.last_scan_at < now()-interval '8 minutes'
+                               THEN 'Waiting for the next scan of this asset'
+                             ELSE a.scan_reason
+                           END) AS details
+                       FROM assets a JOIN asset_catalogs c ON a.mode=c.mode
+                       WHERE {CATALOG_FILTER} AND (%(symbol)s::text IS NULL OR a.symbol=%(symbol)s)
+                       ORDER BY {order} LIMIT %(limit)s OFFSET %(offset)s""",
+                      {"mode": settings.mode, "kind": kind, "query": query, "symbol": symbol,
+                       "offset": offset, "limit": limit}).fetchall()
+
+
+@app.get("/markets")
+def markets(q: str = Query("", max_length=80), kind: str = Query("", pattern="^(stock|crypto)?$"),
+            page: int = Query(1, ge=1, le=2000), symbol: str | None = Query(None, max_length=80)):
+    with connect() as db, db.transaction():
+        db.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        if symbol:
+            rows = catalog_rows(db, "", "", 0, 1, symbol=symbol.upper())
+            if not rows:
+                raise HTTPException(404, "Asset not found")
+            return rows[0]
+        query = q.strip().upper()
+        total = db.execute(f"SELECT count(*) AS total FROM assets a WHERE {CATALOG_FILTER}",
+                           {"mode": settings.mode, "kind": kind, "query": query}).fetchone()["total"]
+        page_size = 50
+        page = min(page, max(1, (total + page_size - 1) // page_size))
+        rows = catalog_rows(db, query, kind, (page - 1) * page_size, page_size)
+    return {"items": rows, "total": total, "page": page, "page_size": page_size}
 
 
 def new_events(after):

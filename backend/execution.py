@@ -52,7 +52,7 @@ def reconcile_orders(db, broker, cycle):
 
 def submit(db, broker, cycle, slot, signal, price, notional, quantity):
     symbol = signal["symbol"]
-    asset_class = settings.universe[symbol]
+    asset_class = signal["asset_class"]
     # A cycle has at most one candidate per symbol. Keep the ID within Alpaca's 48-character limit.
     suffix = hashlib.blake2s(symbol.encode(), digest_size=4).hexdigest()
     client_id = f"ta-{cycle.hex}-{suffix}"
@@ -123,7 +123,10 @@ def risk(db, portfolio, pending, signals, returns, prices, slot):
     drawdown = (high - equity) / high if high > 0 else 1.0
     gross = sum(abs(p["market_value"]) for p in positions.values())
     crypto = sum(abs(p["market_value"]) for p in positions.values() if p["asset_class"] == "crypto")
+    pending = list(pending)
     reserved = pending_risk(pending, prices, portfolio)
+    crypto_symbols = {row["symbol"] for row in pending if row.get("asset_class") == "crypto"}
+    crypto_symbols.update(row["symbol"] for row in signals if row["asset_class"] == "crypto")
     planned = []
     last_entry = {
         row["symbol"]: row["last"] for row in db.execute(
@@ -132,7 +135,7 @@ def risk(db, portfolio, pending, signals, returns, prices, slot):
                GROUP BY symbol""", (settings.mode, list(ACTIVE)))}
     for row in sorted(signals, key=lambda row: (row["side"] != "sell", -row["conviction"])):
         symbol = row["symbol"]
-        is_crypto = settings.universe[symbol] == "crypto"
+        is_crypto = row["asset_class"] == "crypto"
         position = positions.get(symbol)
         if not portfolio["can_trade"]:
             result = "Account is blocked"
@@ -156,7 +159,7 @@ def risk(db, portfolio, pending, signals, returns, prices, slot):
         else:
             outstanding = sum(reserved.values())
             crypto_reserved = sum(value for name, value in reserved.items()
-                                  if name in settings.crypto or name.endswith("USD") or "/" in name)
+                                  if name in crypto_symbols)
             caps = [equity * settings.order_pct, equity * settings.symbol_pct, cash - outstanding,
                     equity * settings.gross_pct - gross - outstanding]
             if is_crypto:

@@ -49,22 +49,31 @@ def demo_bars(symbol, slot):
     return result
 
 
-def alpaca_bars(client, symbol, asset_class, slot):
+def alpaca_bars(client, symbols, asset_class, slot, deadline):
     path = "/v2/stocks/bars" if asset_class == "stock" else "/v1beta3/crypto/us/bars"
-    params = {"symbols": symbol, "timeframe": "5Min",
+    params = {"symbols": ",".join(symbols), "timeframe": "5Min",
               "start": (slot - timedelta(days=14 if asset_class == "stock" else 3)).isoformat(),
               "end": slot.isoformat(), "limit": 10000}
     if asset_class == "stock":
         params.update(feed=settings.stock_feed, adjustment="split")
-    bars = []
+    bars = {symbol: [] for symbol in symbols}
     for _ in range(8):
+        if datetime.now(timezone.utc) >= deadline:
+            raise TimeoutError("Market scan deadline")
         response = client.get(DATA + path, params=params, headers=headers())
         response.raise_for_status()
         page = response.json()
-        bars.extend(Bar(timestamp(row["t"]), *(float(row[key]) for key in ("o", "h", "l", "c", "v")))
-                    for row in (page.get("bars") or {}).get(symbol, []))
+        for symbol, rows in (page.get("bars") or {}).items():
+            if symbol not in bars:
+                continue
+            bars[symbol].extend(
+                Bar(timestamp(row["t"]), *(float(row[key]) for key in ("o", "h", "l", "c", "v")))
+                for row in rows
+            )
         if not page.get("next_page_token"):
-            return [bar for bar in bars if bar.time + timedelta(seconds=BAR_SECONDS) <= slot]
+            last_start = slot - timedelta(seconds=BAR_SECONDS)
+            return {symbol: [bar for bar in group if bar.time <= last_start]
+                    for symbol, group in bars.items()}
         params["page_token"] = page["next_page_token"]
     raise ValueError("Market data pagination exceeded limit")
 
@@ -84,38 +93,43 @@ def validate(bars, slot):
         raise ValueError("Invalid OHLCV values")
 
 
-def scan(client, broker, slot):
-    session_error = None
-    stock_open = False
-    if settings.stocks:
-        try:
-            stock_open = broker.stock_open()
-            if stock_open and settings.mode == "alpaca":
-                broker.load_sessions(slot)
-        except Exception as exc:
-            session_error = f"Market clock unavailable ({type(exc).__name__})"
+def scan(client, broker, slot, selected):
+    deadline = min(datetime.now(timezone.utc) + timedelta(seconds=120),
+                   slot + timedelta(seconds=settings.slot_seconds - 45))
 
-    def fetch(entry):
-        symbol, asset_class = entry
-        if asset_class == "stock":
-            if session_error:
-                return symbol, ("unavailable", session_error, [])
-            if not stock_open:
-                return symbol, ("closed", "US regular session is closed", [])
+    def check(bars):
         try:
-            bars = (demo_bars(symbol, slot) if settings.mode == "demo"
-                    else alpaca_bars(client, symbol, asset_class, slot))
-            if asset_class == "stock" and settings.mode == "alpaca":
-                bars = broker.regular_bars(bars)
             validate(bars, slot)
-            return symbol, ("ready", None, bars)
-        except httpx.HTTPStatusError as exc:
-            return symbol, ("unavailable", f"Market data HTTP {exc.response.status_code}", [])
+            return "ready", None, bars
         except ValueError as exc:
-            message = str(exc) if type(exc) is ValueError else "Invalid upstream market data"
-            return symbol, ("unavailable", message, [])
-        except Exception as exc:
-            return symbol, ("unavailable", f"Market data error ({type(exc).__name__})", [])
+            return "unavailable", str(exc), []
 
+    if settings.mode == "demo":
+        return {symbol: check(demo_bars(symbol, slot)) for symbol in selected}
+
+    def fetch(batch):
+        asset_class, symbols = batch
+        try:
+            results = alpaca_bars(client, symbols, asset_class, slot, deadline)
+        except httpx.HTTPStatusError as exc:
+            code = exc.response.status_code
+            if code in {400, 422} and len(symbols) > 1:
+                half = len(symbols) // 2
+                return {**fetch((asset_class, symbols[:half])), **fetch((asset_class, symbols[half:]))}
+            return dict.fromkeys(symbols, ("unavailable", f"Market data HTTP {code}", []))
+        except TimeoutError:
+            return dict.fromkeys(symbols, ("deferred", "Scan deadline reached", []))
+        except Exception as exc:
+            reason = f"Market data error ({type(exc).__name__})"
+            return dict.fromkeys(symbols, ("unavailable", reason, []))
+
+        return {symbol: check(broker.regular_bars(bars) if asset_class == "stock" else bars)
+                for symbol, bars in results.items()}
+
+    batches = []
+    for asset_class, size in (("crypto", 16), ("stock", 8)):
+        symbols = [symbol for symbol, kind in selected.items() if kind == asset_class]
+        batches.extend((asset_class, symbols[start:start + size])
+                       for start in range(0, len(symbols), size))
     with ThreadPoolExecutor(max_workers=6) as pool:
-        return dict(pool.map(fetch, settings.universe.items()))
+        return {symbol: result for batch in pool.map(fetch, batches) for symbol, result in batch.items()}

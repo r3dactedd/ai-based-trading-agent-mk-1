@@ -156,3 +156,29 @@ td.numeric, .mono { font-family: var(--mono); font-variant-numeric: tabular-nums
   .activity li { grid-template-columns: 96px 1fr; }
   .activity li small { grid-column: 2; }
 }
+
+.catalog-controls, .catalog-pagination {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 0 17px 14px;
+  color: var(--muted);
+  font-size: .875rem;
+}
+.catalog-controls label { display: flex; align-items: center; gap: 8px; }
+.catalog-controls input, .catalog-controls select {
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--base);
+  padding: 7px 10px;
+  color: var(--text);
+  font: inherit;
+}
+.catalog-controls input { width: min(220px, 54vw); }
+.catalog-controls input:focus-visible, .catalog-controls select:focus-visible {
+  outline: 2px solid var(--mint);
+  outline-offset: 2px;
+}
+.catalog-pagination { justify-content: center; margin: 0; padding: 12px; border-top: 1px solid var(--line); }
+.catalog-pagination button:disabled { opacity: .5; cursor: default; }

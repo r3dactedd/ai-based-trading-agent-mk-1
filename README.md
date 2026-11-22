@@ -16,7 +16,7 @@ Open the dashboard at http://localhost:3000. The API and its interactive documen
 
 ## Connect Alpaca paper trading
 
-Copy `.env.example` to `.env` and enter your credentials in that local file. Set `TRADING_MODE=alpaca`, `ALPACA_KEY`, `ALPACA_SECRET`, and `OPENAI_API_KEY`. Keep `AI_MODE=auto` or use `AI_MODE=openai`. The stock feed defaults to IEX. Use `sip` if your Alpaca subscription provides real-time SIP access. Configure fractionable US equities and supported Alpaca USD crypto pairs in the symbol lists. The adapter uses the Alpaca paper hostname for orders.
+Copy `.env.example` to `.env` and enter your credentials in that local file. Set `TRADING_MODE=alpaca`, `ALPACA_KEY`, `ALPACA_SECRET`, and `OPENAI_API_KEY`. Keep `AI_MODE=auto` or use `AI_MODE=openai`. The stock feed defaults to IEX. Use `sip` if your Alpaca subscription provides real-time SIP access. The adapter uses the Alpaca paper hostname for orders.
 
 For Telegram, set both `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`. Start a direct conversation with the bot or add it to the target chat before starting the worker.
 
@@ -25,6 +25,14 @@ docker compose up -d --build
 ```
 
 Demo and Alpaca records are stored separately. To return to demo, change `TRADING_MODE` to `demo` and run the same command.
+
+## Browse the market universe
+
+In Alpaca mode, the worker discovers active US equities and crypto spot pairs through Alpaca’s asset catalog. It refreshes the catalog every six hours. Open **Markets** to search by symbol or name, filter by market, and select a symbol to see its last available chart. **Closed** marks the US market outside regular trading hours. **Queued** marks a symbol awaiting another scan. The Last bar column shows when the displayed five-minute bar began.
+
+The worker rotates up to 160 US equities during regular trading hours and 100 crypto pairs each cycle. It gives held assets priority and reserves capacity for rotation. Use `STOCK_SCAN_LIMIT` and `CRYPTO_SCAN_LIMIT` to tune those budgets. Alpaca data coverage, quote currency, and permissions determine which assets the agent can analyze or paper trade. Non-USD crypto pairs can be analyzed in their native quote currency. Automated entries require a tradable USD crypto pair or a fractionable Alpaca stock. The worker selects up to 24 new entry candidates for AI review per cycle, ordered by quantitative score, and also reviews qualifying exits.
+
+`STOCK_SYMBOLS` and `CRYPTO_SYMBOLS` customize demo mode. Existing Alpaca settings and data remain in the same database when you upgrade. Dashboard and Telegram times use Bangkok time (UTC+7).
 
 ## Trading and recovery behavior
 
