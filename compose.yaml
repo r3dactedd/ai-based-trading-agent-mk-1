@@ -1,0 +1,44 @@
+x-backend: &backend
+  build: ./backend
+  env_file:
+    - path: .env
+      required: false
+  environment:
+    DATABASE_URL: postgresql://trader:trader@db:5432/trader
+  depends_on:
+    db:
+      condition: service_healthy
+  restart: unless-stopped
+
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: trader
+      POSTGRES_USER: trader
+      POSTGRES_PASSWORD: trader
+    volumes:
+      - trading-db:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U trader -d trader]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+  api:
+    <<: *backend
+    command: [uvicorn, api:app, --host, 0.0.0.0]
+    ports: ["127.0.0.1:8000:8000"]
+  worker:
+    <<: *backend
+    command: [python, -u, worker.py]
+  dashboard:
+    build: ./frontend
+    environment:
+      API_INTERNAL_URL: http://api:8000
+    ports: ["127.0.0.1:3000:3000"]
+    depends_on: [api]
+    restart: unless-stopped
+
+volumes:
+  trading-db:
